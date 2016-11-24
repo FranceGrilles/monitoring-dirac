@@ -34,9 +34,9 @@ PROBE_VERSION="0.1"
 #               return STATE_CRITICAL
 #       create_jdl
 # * Create jobs (every 15 min)
-#   launch_job:
+#   submit_job:
 #       store job_id as a timestamped file in $TMP_PATH
-#   launch_job:
+#   submit_job:
 #       store job_id as a timestamped file in $TMP_PATH
 #       wait 30s
 #       delete the job
@@ -101,10 +101,10 @@ STATE_UNKNOWN=3
 STATE_DEPENDENT=4
 
 # Custom values
-JDL=/tmp/dirac-jdl-simple.jdl
-OUT=/tmp/dirac-job-id
 TXT="FG_Monitoring_Simple_Job"
-TMP_PATH=/tmp/dirac-jobs/
+TMP_PATH=/tmp/dirac-jobs
+JDL=/tmp/$TXT.jdl
+JOB_OUT=/tmp
 NAGIOSCMD=/var/spool/nagios/cmd/nagios.cmd
 
 usage () {
@@ -152,25 +152,22 @@ unset LD_LIBRARY_PATH
 
 # echo "[${DATE}] PROCESS_SERVICE_CHECK_RESULT;${HOST};org.irods.irods3.Resource-Iput;${IPUT_RETURN_CODE};${IPUT_PLUGIN_OUTPUT}" > $NAGIOSCMD
 
-# Functions
+## Functions
 
-check_init() {
+check_env() {
     if [ ! -d $TMP_PATH ]; then
         mkdir -p $TMP_PATH
     fi
-}
 
-check_proxy() {
     if ! dirac-proxy-info -v > /dev/null ; then
         echo "Proxy is not valid !"
         exit $STATE_CRITICAL
     else
+        # TODO : check validity time <7d:WARN/ <1d:CRIT
         echo "Proxy is valid"
     fi
-}
 
-make_jdl() {
-cat <<EOF > $JDL
+    cat <<EOF > $JDL
 JobName       = "$TXT";
 Executable    = "/bin/echo";
 Arguments     = "$TXT";
@@ -180,47 +177,94 @@ OutputSandbox = {"StdOut","StdErr"};'
 EOF
 }
 
-launch_job() {
+check_exit_code() {
+    local EXIT_CODE=$1
+    #TODO
+}
+
+submit_job() {
+    local OUT=$TMP_PATH/`date +%s`
     dirac-wms-job-submit -f $OUT $JDL
-    ID=$(cat $OUT)
-}
-
-check_status_done() {
-    STATUS=$(dirac-wms-job-status -f $OUT | awk '{print $2}')
-    if [ "$STATUS" == "Status=Done;" ]; then
-        echo "True"
-    else
-        echo "$STATUS"
-    fi
-}
-
-check_output() {
-    dirac-wms-job-get-output -D /tmp/ $ID
-    if [ "$(cat /tmp/$ID/StdOut)" == "$TXT" ]; then
-        dirac-wms-job-delete $ID
-        rm /tmp/$ID/ -rf
-        rm $JDL $OUT -f
-        echo "All Good !"
-        exit $STATE_OK
-    else
-        echo "Too Bad..."
-        exit $STATE_CRITICAL
-    fi
+    check_exit_code $?
+    echo `cat $OUT`
 }
 
 delete_job() {
-    dirac-wms-job-kill $ID
+    local ID=$1
+    sleep 3
+    dirac-wms-job-delete $ID
+    check_exit_code $?
 }
 
+kill_job() {
+    local ID=$1
+    dirac-wms-job-kill $ID
+    check_exit_code $?
+}
 
-# Go for it !
-check_init
-check_proxy
-make_jdl
-launch_job
-DONE="Init..."
-while [ "$DONE" != "True" ]; do
-    DONE=`check_status_done`
-    echo "Not done already : $DONE"
-done
-check_output
+check_output() {
+    local ID=$1
+
+    dirac-wms-job-get-output -D $JOB_OUT $ID
+    check_exit_code $?
+    
+    if [ "$(cat $JOB_OUT/$ID/StdOut)" == "$TXT" ]; then
+        echo $STATE_OK
+    else
+        echo $STATE_CRITICAL
+    fi
+}
+
+clean_job() {
+    local ID=$1
+    rm $JOB_OUT/$ID -rf
+}
+
+check_status() {
+    local ID=$1
+    local RCODE=$STATE_OK
+
+    local STATUS=$(dirac-wms-job-status $ID)
+    check_exit_code $?
+    STATUS=$(awk '{print $2}' $STATUS)
+
+    if [ "$STATUS" == "Status=Done;" ]; then
+        RCODE=`check_output $ID`
+        delete_job $ID
+        clean_job $ID
+        echo $RCODE
+    fi
+
+    if [ "$STATUS" == "Status=Deleted;" ]; then
+    fi
+
+    if [ "$STATUS" == "Status=Waiting;" ]; then
+    fi
+
+    if [ "$STATUS" == "Status=Failed;" ]; then
+    fi
+
+    if [ "$STATUS" == "Status=NotFound;" ]; then
+        # TODO : check "NotFound"
+    fi
+}
+
+## Go for it !
+
+start_jobs() {
+    check_env
+    submit_job
+    delete_job `submit_job`
+}
+
+check_jobs() {
+    local EXIT_CODE=$STATE_OK
+    for FILE in `find $TMP_PATH`; do
+        local ID=`cat $FILE`
+        local RCODE=`check_status $ID`
+        if [ $RCODE -gt $EXIT_CODE ]; then
+            EXIT_CODE=$RCODE
+        fi
+    done
+    exit $EXIT_CODE
+}
