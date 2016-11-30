@@ -22,6 +22,7 @@
 #       Initial Release
 
 PROBE_VERSION="0.1"
+DEBUG=true
 
 ## Workflow
 # ---------
@@ -99,6 +100,7 @@ STATE_WARNING=1
 STATE_CRITICAL=2
 STATE_UNKNOWN=3
 STATE_DEPENDENT=4
+RCODE=$STATE_OK
 
 # Custom values
 TXT="FG_Monitoring_Simple_Job"
@@ -139,70 +141,98 @@ fi
 
 ## Functions
 
+log() {
+    if $DEBUG; then
+        echo -e "$(date '+%Y-%M-%d %H:%M:%S %Z') $@" >> $LOGFILE
+    fi
+}
+
 check_env() {
-    echo "Checking env" >> $LOGFILE
+    local PROXY_INFO=""
+    local TIME_LEFT=0
+
     if [ -z "$DIRAC" ]; then
-        echo -e "DIRAC environment not set !\nPlease source DIRAC's bashrc !"
+        echo "DIRAC environment not set !"
+        echo "Please source DIRAC's bashrc !"
         exit $STATE_CRITICAL
     fi
 
     if [ ! -d $TMP_PATH ]; then
+        log "TMP_PATH Not found !"
+        log "Creating TMP_PATH in $TMP_PATH..."
         mkdir -p $TMP_PATH
     fi
 
-    if ! dirac-proxy-info -v > /dev/null ; then
+    if ! PROXY_INFO=$(dirac-proxy-info -v | awk '/timeleft/ { print $3 }') ; then
         echo "Proxy is not valid !"
         echo "Did you initialise it with 'dirac-proxy-init -g biomed_user' ?"
         exit $STATE_CRITICAL
     else
-        # TODO : check validity time <7d:WARN/ <1d:CRIT
-        echo "Proxy is valid"
+        TIME_LEFT=$(echo $PROXY_INFO | awk -F ":" '{ print $1 }')
+        if [ "$TIME_LEFT" -lt "24" ]; then
+            echo "CRITICAL : Proxy is valid for less than a day !!!"
+            RCODE=$STATE_CRITICAL
+        elif [ "$TIME_LEFT" -lt "168" ]; then
+            echo "WARNING : Proxy is valid for less than a week !!!"
+            RCODE=$STATE_WARNING
+        fi
     fi
 
+    log "Creating JDL at $JDL"
     cat <<EOF > $JDL
 JobName       = "$TXT";
 Executable    = "/bin/echo";
 Arguments     = "$TXT";
 StdOutput     = "StdOut";
 StdError      = "StdErr";
-OutputSandbox = {"StdOut","StdErr"};'
+OutputSandbox = {"StdOut","StdErr"};
 EOF
 }
 
 check_exit_code() {
     local EXIT_CODE=$1
-    echo "Exit code is $EXIT_CODE"  >> $LOGFILE
-    #TODO
+    log "Exit code is $EXIT_CODE"
+    # TODO Check exit code
 }
 
 submit_job() {
     local OUT=$TMP_PATH/`date +%s`
-    echo "Submitting job in $OUT"  >> $LOGFILE
-    dirac-wms-job-submit -f $OUT $JDL >> $LOGFILE
+    log "Submitting job in $OUT"
+    dirac-wms-job-submit -f $OUT $JDL >> /dev/null
     check_exit_code $?
-    echo "JobId submitted is `cat $OUT`"  >> $LOGFILE
+    log "JobId submitted is `cat $OUT`"
     echo `cat $OUT`
 }
 
 delete_job() {
     local ID=$1
-    echo "Deleting job $ID"  >> $LOGFILE
+    log "Deleting job $ID"
     sleep 3
-    dirac-wms-job-delete $ID >> $LOGFILE
+    log $(dirac-wms-job-delete $ID)
     check_exit_code $?
 }
 
 kill_job() {
     local ID=$1
-    echo "Killing job $ID"  >> $LOGFILE
-    dirac-wms-job-kill $ID >> $LOGFILE
+    log "Killing job $ID"
+    log $(dirac-wms-job-kill $ID)
+    check_exit_code $?
+}
+
+reschedule_job() {
+
+    # TODO
+
+    local ID=$1
+    log "Rescheduling job $ID"
+    log $(dirac-wms-job-reschedule $ID)
     check_exit_code $?
 }
 
 check_output() {
     local ID=$1
-    echo "Checking output of job $ID"  >> $LOGFILE
-    dirac-wms-job-get-output -D $JOB_OUT $ID >> $LOGFILE
+    log "Checking output of job $ID"
+    log $(dirac-wms-job-get-output -D $JOB_OUT $ID)
     check_exit_code $?
     
     if [ "$(cat $JOB_OUT/$ID/StdOut)" = "$TXT" ]; then
@@ -215,7 +245,7 @@ check_output() {
 clean_job() {
     local ID=$1
     local FILE=$2
-    echo "Cleaning job $ID"  >> $LOGFILE
+    log "Cleaning job $ID"
     if [ -f $JOB_OUT/$ID/StdOut ]; then
         rm $JOB_OUT/$ID/*
         rmdir $JOB_OUT/$ID
@@ -225,34 +255,70 @@ clean_job() {
     fi
 }
 
+check_time() {
+    local ID=$1
+    local FILE=$2
+    local TIME_WINDOW=$(($3-1))
+    local SUB_TIME=$(basename $FILE)
+    local NOW=$(date +%s)
+
+    log "Checking if job was created less than $(date +%-H --date=@$TIME_WINDOW)h ago"
+    log "Time difference is $(( $NOW - $SUB_TIME ))"
+
+    if [ $(( $NOW - $SUB_TIME )) -lt "$TIME_WINDOW" ]; then
+        log "Seems good, waiting..."
+        echo $STATE_OK
+    else
+        log "Seems too long... WARNING !"
+        echo $STATE_WARNING
+    fi
+}
+
 check_status() {
     local ID=$1
     local FILE=$2
-    local RCODE=$STATE_OK
 
-    echo "Checking status of job $ID"  >> $LOGFILE
+    log "Checking status of job $ID"
     local STATUS=$(dirac-wms-job-status "$ID")
     check_exit_code $?
 
-    echo "STATUS is $STATUS"  >> $LOGFILE
+    log "STATUS is $STATUS"
     STATUS=$(echo $STATUS | awk '{print $2}')
 
-    echo "$ID $STATUS"  >> $LOGFILE
-    if [ "$STATUS" = "Status=Done;" ]; then
-        echo "$ID Done"  >> $LOGFILE
-        RCODE=`check_output $ID`
-        delete_job $ID
+    if [ "$STATUS" = "Status=Received;" ]; then
+        RCODE=$(check_time $ID $FILE 3600)
         echo $RCODE
     fi
 
-    if [ "$STATUS" = "Status=Deleted;" ]; then
-        # TODO : check if job is deleted < 24h : OK / WARN
-        echo $STATE_OK
+    if [ "$STATUS" = "Status=Checking;" ]; then
+        RCODE=$(check_time $ID $FILE 3600)
+        echo $RCODE
     fi
 
     if [ "$STATUS" = "Status=Waiting;" ]; then
-        # TODO : check if job is created < 2h : OK / WARN
-        echo $STATE_OK
+        RCODE=$(check_time $ID $FILE 7200)
+        echo $RCODE
+    fi
+
+    if [ "$STATUS" = "Status=Running;" ]; then
+        RCODE=$(check_time $ID $FILE 7200)
+        echo $RCODE
+    fi
+
+    if [ "$STATUS" = "Status=Stalled;" ]; then
+        RCODE=$(check_time $ID $FILE 7200)
+        echo $RCODE
+    fi
+    
+    if [ "$STATUS" = "Status=Completed;" ]; then
+        RCODE=$(check_time $ID $FILE 7200)
+        echo $RCODE
+    fi
+
+    if [ "$STATUS" = "Status=Done;" ]; then
+        RCODE=`check_output $ID`
+        delete_job $ID
+        echo $RCODE
     fi
 
     if [ "$STATUS" = "Status=Failed;" ]; then
@@ -260,29 +326,14 @@ check_status() {
         echo $STATE_CRITICAL
     fi
 
-    if [ "$STATUS" = "Status=Received;" ]; then
-        echo $STATE_OK
-    fi
-
-    if [ "$STATUS" = "Status=Checking;" ]; then
-        echo $STATE_OK
-    fi
-
-    if [ "$STATUS" = "Status=Running;" ]; then
-        echo $STATE_OK
-    fi
-
-    if [ "$STATUS" = "Status=Stalled;" ]; then
-        echo $STATE_WARN
-    fi
-
-    if [ "$STATUS" = "Status=Completed;" ]; then
-        echo $STATE_OK
-    fi
-
     if [ "$STATUS" = "Status=Killed;" ]; then
-        delete_job $ID
-        echo $STATE_WARNING
+        RCODE=$(check_time $ID $FILE 7200)
+        echo $RCODE
+    fi
+
+    if [ "$STATUS" = "Status=Deleted;" ]; then
+        RCODE=$(check_time $ID $FILE 3600)
+        echo $RCODE
     fi
 
     if [ "$STATUS" = "" ]; then
@@ -293,34 +344,43 @@ check_status() {
 
 ## Go for it !
 
-
 start_jobs() {
+    log "Checking environment and proxy..."
     check_env
-    submit_job
-    local TOBEDELETED=`submit_job`
-    echo "To be deleted : $TOBEDELETED"  >> $LOGFILE
+    log "Submitting some jobs..."
+    log "Normal JobID : $(submit_job)"
+    sleep 2
+    local TOBEDELETED=$(submit_job)
+    log "JobID to be deleted : $TOBEDELETED"
     delete_job $TOBEDELETED
+    log "----------------------------------------------------" 
 }
 
 check_jobs() {
+    log "Checking environment and proxy..."
+    check_env
     local EXIT_CODE=$STATE_OK
-    echo "For files...."  >> $LOGFILE
-    local FILES=`find $TMP_PATH -type f`
+    log "Checking jobs from files (if any)..."
+    local FILES=$(find $TMP_PATH -type f)
     if [ ${#FILES[@]} -gt 0 ]; then
         for FILE in $FILES; do
-            local ID=`cat $FILE`
-            echo "JobID from file $FILE : $ID"  >> $LOGFILE
-            local RCODE=`check_status $ID $FILE`
-            echo "RCODE : $RCODE"  >> $LOGFILE
+            local ID=$(cat $FILE)
+            log "Found JobID $ID from file $FILE"
+            local RCODE=$(check_status $ID $FILE)
+            log "Status Code for JobID $ID : $RCODE"
             if [ "$RCODE" -gt "$EXIT_CODE" ]; then
                 EXIT_CODE=$RCODE
             fi
         done
     fi
+    log "----------------------------------------------------" 
     exit $EXIT_CODE
 }
 
-# Parse arguments                                                           
+## Parse arguments                                                           
+
+log "----------------New check starting...---------------" 
+
 while [ $# -gt 0 ]; do
     case "$1" in
         -h) 
@@ -330,11 +390,13 @@ while [ $# -gt 0 ]; do
             echo "Version: $PROBE_VERSION"
             exit $STATE_OK
             ;;
-        -s) 
+        -s)
+            log "             --- Starting jobs ---"
             start_jobs
             shift
             ;;
         -c) 
+            log "         --- Checking job statuses ---"
             check_jobs
             shift
             ;;
