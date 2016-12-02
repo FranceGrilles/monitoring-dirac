@@ -34,26 +34,30 @@ export X509_USER_KEY=~/.globus/userkey.pem
 ## Workflow
 # ---------
 # * check_env : 
-#       check_or_create $TMP_PATH
 #       check_proxy
 #           if proxy_is_valid < 7 days
 #               return STATE_WARNING
 #           if proxy_is_valid < 1 day
 #               return STATE_CRITICAL
+#       check_or_create $TMP_PATH
 #       create_jdl
-# * Create jobs (every 15 min)
-#   submit_job:
-#       store job_id as a timestamped file in $TMP_PATH
-#   submit_job:
-#       store job_id as a timestamped file in $TMP_PATH
-#       wait 30s
-#       delete the job
 #
-# * Check jobs :
-# For each job_id in $TMP_PATH, check_job_status
+# * Create jobs (every 60 min)
+#   submit_job:
+#       store job_id as a timestamped file in $TMP_PATH
+#   submit_job:
+#       store job_id as a timestamped file in $TMP_PATH
+#       wait 2s
+#       delete the job (job will have status=Killed)
+#
+# * Check jobs (every 60 min)
+#   For each job_id in $TMP_PATH, check_job_status :
 #   if Status in { Received, Checking, Running, Completed }
 #       do_nothing/wait
-#       return STATE_OK
+#       if job_created < 2h
+#           return STATE_OK
+#       else
+#           return STATE_WARNING
 #
 #   if Status == Done
 #       check_job_output
@@ -64,25 +68,35 @@ export X509_USER_KEY=~/.globus/userkey.pem
 #       delete_job_and_output
 #
 #   if Status == Deleted
-#       if job_is_deleted < 24h
+#       if job_is_deleted < 1h
 #           return STATE_OK
 #       else
 #           return STATE_WARNING
 #
 #   if Status == Waiting
+#       do_nothing/wait
 #       if job_created < 2h
-#           do_nothing/wait
 #           return STATE_OK
 #       else
 #           return STATE_WARNING
 #
-#   if Status in { Stalled, Killed }
-#       delete_job
-#       return STATE_WARNING
+#   if Status == Stalled
+#       if job_created < 2h
+#           delete_job
+#           return STATE_WARNING
+#       else
+#           do_nothing/wait
 #
 #   if Status == Failed
 #       delete_job
 #       return STATE_CRITICAL
+#
+#   if Status == Killed
+#       if job_created < 1h
+#           do_nothing/wait
+#       else
+#           reschedule_job
+#       return STATE_OK
 #
 #   if Status == JobNotFound
 #       delete_file in $TMP_PATH
@@ -384,6 +398,7 @@ check_status() {
             reschedule_job $ID
             ACTION="Rescheduling job"
         fi
+        RCODE=$STATE_OK
         TMP="DONOTPARSE"
 
     elif [ "$STATUS" = "Status=Deleted;" ]; then
