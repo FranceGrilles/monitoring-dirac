@@ -24,6 +24,13 @@
 PROBE_VERSION="0.1"
 DEBUG=true
 
+source /usr/lib/dirac/bashrc
+export X509_CERT_DIR=/etc/grid-security/certificates
+export X509_USER_CERT=~/.globus/usercert.pem
+export X509_VOMS_DIR=/usr/lib/dirac/etc/grid-security/vomsdir
+export X509_USER_PROXY=/tmp/x509up_u500
+export X509_USER_KEY=~/.globus/userkey.pem
+
 ## Workflow
 # ---------
 # * check_env : 
@@ -154,8 +161,9 @@ perf_output() {
     local STATUS=${STATUS_ALL[$1]}
     TIME_NOW=$(date +%s)
     EXEC_TIME=$(( $TIME_NOW - $TIME_START ))
-    echo -e "$OUTPUT"
     local OUT_PERF="$STATUS|exec_time=$EXEC_TIME;;;; nb_jobs=$NB_JOBS;;;; nb_jobs_ok=$NB_JOBS_OK;;;; nb_jobs_ko=$NB_JOBS_CRITICAL;;;; nb_jobs_warn=$NB_JOBS_WARNING;;;;"
+    echo "$STATUS"
+    echo -e "$OUTPUT"
     log "$OUT_PERF"
     echo "$OUT_PERF"
     exit $1
