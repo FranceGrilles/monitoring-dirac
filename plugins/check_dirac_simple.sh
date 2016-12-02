@@ -189,13 +189,13 @@ check_env() {
     if [ -z "$DIRAC" ]; then
         log_output "DIRAC environment not set !"
         log_output "Please source DIRAC's bashrc !"
-        exit $STATE_CRITICAL
+        perf_output $STATE_CRITICAL
     fi
 
     if ! PROXY_INFO=$(dirac-proxy-info -v | awk '/timeleft/ { print $3 }') ; then
         log_output "Proxy is not valid !"
         log_output "Did you initialise it with 'dirac-proxy-init -g biomed_user' ?"
-        exit $STATE_CRITICAL
+        perf_output $STATE_CRITICAL
     else
         TIME_LEFT=$(echo $PROXY_INFO | awk -F ":" '{ print $1 }')
         if [ "$TIME_LEFT" -lt "24" ]; then
