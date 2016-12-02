@@ -451,7 +451,6 @@ check_jobs() {
             local RCODE=$(echo $TMP | awk '{print $1}')
             local STATUS=$(echo $TMP | awk '{print $2}')
             local ACTION=$(echo $TMP | awk '{print $3}')
-            log "tmp: $TMP / rcode: $RCODE / action: $ACTION"
             perf_compute $RCODE
             log_output "JobID $ID : $STATUS / Action=$ACTION; (${STATUS_ALL[$1]})"
             if [ "$RCODE" -gt "$EXIT_CODE" ]; then
