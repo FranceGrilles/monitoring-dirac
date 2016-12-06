@@ -130,6 +130,7 @@ NB_JOBS_WARNING=0
 NB_JOBS_CRITICAL=0
 
 # Custom values
+TIMEOUT="15s"
 TXT="FG_Monitoring_Simple_Job"
 TMP_PATH=/tmp/dirac-jobs
 JDL=/tmp/$TXT.jdl
@@ -169,6 +170,7 @@ perf_compute() {
     elif [ "$JOB_STATUS" = "$STATE_CRITICAL" ]; then
         ((NB_JOBS_CRITICAL++))
     fi
+    log "nb_jobs=$NB_JOBS; nb_jobs_ok=$NB_JOBS_OK; nb_jobs_crit=$NB_JOBS_CRITICAL; nb_jobs_warn=$NB_JOBS_WARNING;"
 }
 
 perf_output() {
@@ -202,6 +204,25 @@ version() {
     echo "$0 version $PROBE_VERSION"
 }
 
+check_exit_code() {
+    local EXCODE=$1
+    log "Exit code is $EXCODE"
+
+    if [ $EXCODE -eq "124" ]; then
+        log_output "There was a timeout ($TIMEOUT) in dirac's command"
+        EXIT_CODE=$STATE_CRITICAL
+    fi
+
+    # TODO Check exit code
+}
+
+check_timeout() {
+    local COMMAND=$1
+    log "Running command : $COMMAND"
+    timeout $TIMEOUT $COMMAND
+    check_exit_code $?
+}
+
 check_env() {
     local PROXY_INFO=""
     local TIME_LEFT=0
@@ -214,12 +235,15 @@ check_env() {
         perf_output $STATE_CRITICAL
     fi
 
-    if ! PROXY_INFO=$(dirac-proxy-info -v | awk '/timeleft/ { print $3 }') ; then
+    PROXY_INFO=$(check_timeout "dirac-proxy-info -v")
+    TIME_LEFT=$(echo "$PROXY_INFO" | awk '/timeleft/ { print $3 }')
+    TIME_LEFT=$(echo "$TIME_LEFT" | awk -F ":" '{ print $1 }')
+
+    if ! [ "$TIME_LEFT" -eq "$TIME_LEFT" ] 2>/dev/null; then
         log_output "Proxy is not valid !"
         log_output "Did you initialise it with 'dirac-proxy-init -g biomed_user' ?"
         perf_output $STATE_CRITICAL
     else
-        TIME_LEFT=$(echo $PROXY_INFO | awk -F ":" '{ print $1 }')
         if [ "$TIME_LEFT" -lt "24" ]; then
             log_output "CRITICAL : Proxy is valid for less than a day !!!"
             output "Tip : 'dirac-proxy-init -g biomed_user -v 720:00'"
@@ -251,17 +275,10 @@ OutputSandbox = {"StdOut","StdErr"};
 EOF
 }
 
-check_exit_code() {
-    local EXIT_CODE=$1
-    log "Exit code is $EXIT_CODE"
-    # TODO Check exit code
-}
-
 submit_job() {
     local OUT=$TMP_PATH/`date +%s`
     log "Submitting job in $OUT"
-    dirac-wms-job-submit -f $OUT $JDL >> /dev/null
-    check_exit_code $?
+    check_timeout "dirac-wms-job-submit -f $OUT $JDL" >> /dev/null 2>&1
     log "JobId submitted is `cat $OUT`"
     echo `cat $OUT`
 }
@@ -270,47 +287,50 @@ delete_job() {
     local ID=$1
     log "Deleting job $ID"
     sleep 1
-    log "$(dirac-wms-job-delete $ID)"
-    check_exit_code $?
+    check_timeout "dirac-wms-job-delete $ID" >> /dev/null 2>&1
 }
 
 kill_job() {
     local ID=$1
     log "Killing job $ID"
-    log "$(dirac-wms-job-kill $ID)"
-    check_exit_code $?
+    check_timeout "dirac-wms-job-kill $ID" >> /dev/null 2>&1
 }
 
 reschedule_job() {
     local ID=$1
     log "Rescheduling job $ID"
-    log "$(dirac-wms-job-reschedule $ID)"
-    check_exit_code $?
-}
-
-check_output() {
-    local ID=$1
-    log "Checking output of job $ID"
-    log "$(dirac-wms-job-get-output -D $JOB_OUT $ID)"
-    check_exit_code $?
-    
-    if [ "$(cat $JOB_OUT/$ID/StdOut)" = "$TXT" ]; then
-        echo $STATE_OK
-    else
-        echo $STATE_CRITICAL
-    fi
+    check_timeout "dirac-wms-job-reschedule $ID" >> /dev/null 2>&1
 }
 
 clean_job() {
     local ID=$1
     local FILE=$2
-    log "Cleaning job $ID"
-    if [ -f $JOB_OUT/$ID/StdOut ]; then
-        rm $JOB_OUT/$ID/*
-        rmdir $JOB_OUT/$ID
+    log "Cleaning job $ID ($FILE)"
+
+    if [ -d $JOB_OUT/$ID ]; then
+        log "Removing $JOB_OUT/$ID/* : $(rm $JOB_OUT/$ID/*)"
+        log "Removing $JOB_OUT/$ID/  : $(rmdir $JOB_OUT/$ID)"
+    else
+        log "Directory $JOB_OUT/$ID not found (so not deleted)..."
     fi
+    #if [ -z ${FILE+x} ] && [ -f $FILE ]; then
     if [ -f $FILE ]; then
-        rm $FILE
+        log "Removing $FILE : $(rm $FILE)"
+    else
+        log "[ -z ${FILE+x} ] && [ -f $FILE ] : Did not match..."
+    fi
+}
+
+check_output() {
+    local ID=$1
+    clean_job $ID
+    log "Checking output of job $ID"
+    check_timeout "dirac-wms-job-get-output -D $JOB_OUT $ID" >> /dev/null 2>&1
+    
+    if [ "$(cat $JOB_OUT/$ID/StdOut)" = "$TXT" ]; then
+        echo $STATE_OK
+    else
+        echo $STATE_CRITICAL
     fi
 }
 
@@ -342,31 +362,33 @@ check_status() {
     local TMP="$RCODE $ACTION"
 
     log "Checking status of job $ID"
-    local STATUS=$(dirac-wms-job-status "$ID")
-    check_exit_code $?
+    local STATUS=$(check_timeout "dirac-wms-job-status \"$ID\"")
 
     STATUS=$(echo $STATUS | awk '{print $2}')
     if [ "$STATUS" = "" ]; then
-        log_output "Status=NotFound; (Assuming already cleaned)"
+        log_output "Status=NotFound; (Assuming already deleted)"
     else
         log_output "$STATUS"
     fi
 
 
     if [ "$STATUS" = "Status=Received;" ]; then
-        TMP="$(check_time $ID $FILE 3600)"
+        TMP="$(check_time $ID $FILE 14400)"
 
     elif [ "$STATUS" = "Status=Checking;" ]; then
-        TMP=$(check_time $ID $FILE 3600)
+        TMP=$(check_time $ID $FILE 14400)
 
     elif [ "$STATUS" = "Status=Waiting;" ]; then
-        TMP=$(check_time $ID $FILE 7200)
+        TMP=$(check_time $ID $FILE 14400)
 
     elif [ "$STATUS" = "Status=Running;" ]; then
-        TMP=$(check_time $ID $FILE 7200)
+        TMP=$(check_time $ID $FILE 14400)
+
+    elif [ "$STATUS" = "Status=Matched;" ]; then
+        TMP=$(check_time $ID $FILE 14400)
 
     elif [ "$STATUS" = "Status=Stalled;" ]; then
-        TMP=$(check_time $ID $FILE 7200)
+        TMP=$(check_time $ID $FILE 14400)
         RCODE=$(echo $TMP | awk '{print $1}')
         ACTION=$(echo $TMP | awk '{print $2}')
         if [ "$RCODE" -gt "0" ]; then
@@ -376,7 +398,7 @@ check_status() {
         TMP="DONOTPARSE"
 
     elif [ "$STATUS" = "Status=Completed;" ]; then
-        TMP=$(check_time $ID $FILE 7200)
+        TMP=$(check_time $ID $FILE 14400)
 
     elif [ "$STATUS" = "Status=Done;" ]; then
         RCODE=`check_output $ID`
@@ -391,7 +413,7 @@ check_status() {
         TMP="DONOTPARSE"
 
     elif [ "$STATUS" = "Status=Killed;" ]; then
-        TMP=$(check_time $ID $FILE 3600)
+        TMP=$(check_time $ID $FILE 14400)
         RCODE=$(echo $TMP | awk '{print $1}')
         ACTION=$(echo $TMP | awk '{print $2}')
         if [ "$RCODE" -gt "0" ]; then
@@ -402,7 +424,7 @@ check_status() {
         TMP="DONOTPARSE"
 
     elif [ "$STATUS" = "Status=Deleted;" ]; then
-        TMP=$(check_time $ID $FILE 3600)
+        TMP=$(check_time $ID $FILE 14400)
 
     elif [ "$STATUS" = "" ]; then
         clean_job $ID $FILE
@@ -429,11 +451,13 @@ start_jobs() {
     log_output "Submitting some jobs..."
     log_output "---"
     log_output "Normal JobID : $(submit_job)"
+    perf_compute $EXIT_CODE
     sleep 2
     local TOBEDELETED=$(submit_job)
     log_output "---"
     log_output "JobID to be deleted : $TOBEDELETED"
     delete_job $TOBEDELETED
+    perf_compute $EXIT_CODE
     log_output "----------------------------------------------------"
 }
 
