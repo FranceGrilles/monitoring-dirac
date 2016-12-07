@@ -20,86 +20,107 @@
 # Changelog:
 # v0.1 2016-12-01 Vincent Gatignol-Jamon <gatignol-jamon@idgrilles.fr>
 #       Initial Release
+# v0.2 2016-12-07 Vincent Gatignol-Jamon <gatignol-jamon@idgrilles.fr>
+#       Add timeout management of dirac's commands
+#       Workflow review
 
-PROBE_VERSION="0.1"
+## Please adapt to your local settings
+
+# path to dirac client
+DIRAC_PATH=/usr/lib/dirac
+
+# activate debug logs ?
 DEBUG=true
 
-source /usr/lib/dirac/bashrc
+# where to put the logs
+LOGFILE=/tmp/dirac_logs
+
+# time allowed for dirac's commands to execute
+TIMEOUT="15s"
+
+# Job name / comparison sting (no space)
+TXT="FG_Monitoring_Simple_Job"
+
+# temporary path (subdirectories "dirac-jobs" and "dirac-outputs" will be
+# created here).
+TMP_PATH=/tmp
+
+# These global vars are not defined for this nagios user/session
+# (only defined by dirac-proxy-init)
 export X509_CERT_DIR=/etc/grid-security/certificates
 export X509_USER_CERT=~/.globus/usercert.pem
-export X509_VOMS_DIR=/usr/lib/dirac/etc/grid-security/vomsdir
-export X509_USER_PROXY=/tmp/x509up_u500
 export X509_USER_KEY=~/.globus/userkey.pem
+export X509_USER_PROXY=/tmp/x509up_u500
+
+### Do not edit below this line ### 
+
+PROBE_VERSION="0.2"
 
 ## Workflow
 # ---------
-# * check_env : 
+# * source DIRAC environment (bashrc)
+# * each dirac's command is checked against a timeout and its exit_code
+#       - if timeout; return STATE_WARNING
+# * check_env :
+#       check_dirac_environment
 #       check_proxy
 #           if proxy_is_valid < 7 days
 #               return STATE_WARNING
 #           if proxy_is_valid < 1 day
 #               return STATE_CRITICAL
-#       check_or_create $TMP_PATH
+#       check_or_create $TMP_PATH/{dirac-jobs,dirac-outputs}
 #       create_jdl
 #
 # * Create jobs (every 60 min)
+#
 #   submit_job:
-#       store job_id as a timestamped file in $TMP_PATH
+#       store job_id as a timestamped file in $TMP_PATH/dirac-jobs
 #   submit_job:
-#       store job_id as a timestamped file in $TMP_PATH
+#       store job_id as a timestamped file in $TMP_PATH/dirac-jobs
 #       wait 2s
 #       delete the job (job will have status=Killed)
 #
 # * Check jobs (every 60 min)
-#   For each job_id in $TMP_PATH, check_job_status :
-#   if Status in { Received, Checking, Running, Completed }
+#
+#   For each job_id in $TMP_PATH/dirac-jobs : check_job_status
+#
+#   if Status in { Received, Checking, Waiting, Running,
+#                  Matched, Completed, Deleted }
 #       do_nothing/wait
-#       if job_created < 2h
+#       if job_created < 4h
 #           return STATE_OK
 #       else
 #           return STATE_WARNING
 #
-#   if Status == Done
+#   if Status = Done
 #       check_job_output
 #       if output is expected
 #           return STATE_OK
 #       else
 #           return STATE_CRITICAL
-#       delete_job_and_output
+#       delete_job
 #
-#   if Status == Deleted
-#       if job_is_deleted < 1h
+#   if Status = Stalled
+#       if job_created < 4h
+#           do_nothing/wait
 #           return STATE_OK
 #       else
-#           return STATE_WARNING
-#
-#   if Status == Waiting
-#       do_nothing/wait
-#       if job_created < 2h
-#           return STATE_OK
-#       else
-#           return STATE_WARNING
-#
-#   if Status == Stalled
-#       if job_created < 2h
 #           delete_job
 #           return STATE_WARNING
-#       else
-#           do_nothing/wait
 #
-#   if Status == Failed
+#   if Status = Failed
 #       delete_job
 #       return STATE_CRITICAL
 #
-#   if Status == Killed
+#   if Status = Killed
 #       if job_created < 1h
 #           do_nothing/wait
 #       else
 #           reschedule_job
 #       return STATE_OK
 #
-#   if Status == JobNotFound
-#       delete_file in $TMP_PATH
+#   if Status = JobNotFound
+#       clean_job in $TMP_PATH
 #       return STATE_OK
         
 ## List of job statuses
@@ -113,7 +134,8 @@ export X509_USER_KEY=~/.globus/userkey.pem
 # Done          Job is fully finished
 # Failed        Job is finished unsuccessfully
 # Killed        Job received KILL signal from the user
-# Deleted       Job is marked for deletion 
+# Deleted       Job is marked for deletion
+# Matched       ? 
 
 # Nagios exit status codes
 STATE_OK=0
@@ -123,20 +145,17 @@ STATE_UNKNOWN=3
 STATE_DEPENDENT=4
 STATUS_ALL=('OK' 'WARNING' 'CRITICAL' 'UNKNOWN' 'DEPENDENT')
 EXIT_CODE=$STATE_OK
+
+# Output computing stuff
 OUTPUT="" 
 NB_JOBS=0
 NB_JOBS_OK=0
 NB_JOBS_WARNING=0
 NB_JOBS_CRITICAL=0
-
-# Custom values
-TIMEOUT="15s"
-TXT="FG_Monitoring_Simple_Job"
-TMP_PATH=/tmp/dirac-jobs
-JDL=/tmp/$TXT.jdl
-JOB_OUT=/tmp
-LOGFILE=/tmp/dirac_logs
 TIME_START=$(date +%s)
+
+# Get DIRAC environment
+source $DIRAC_PATH/bashrc
 
 # unset LD_LIBRARY_PATH as it cause awk/sed to fail
 unset LD_LIBRARY_PATH
@@ -150,14 +169,14 @@ log() {
 }
 
 output() {
-    local TXT="$1"
-    OUTPUT+="$(date '+%Y-%M-%d %H:%M:%S %Z') $TXT\n"
+    local TEXT="$1"
+    OUTPUT+="$(date '+%Y-%M-%d %H:%M:%S %Z') $TEXT\n"
 }
 
 log_output() {
-    local TXT="$1"
-    log "$TXT"
-    output "$TXT"
+    local TEXT="$1"
+    log "$TEXT"
+    output "$TEXT"
 }
 
 perf_compute() {
@@ -173,7 +192,7 @@ perf_compute() {
     log "nb_jobs=$NB_JOBS; nb_jobs_ok=$NB_JOBS_OK; nb_jobs_crit=$NB_JOBS_CRITICAL; nb_jobs_warn=$NB_JOBS_WARNING;"
 }
 
-perf_output() {
+perf_exit() {
     local STATUS=${STATUS_ALL[$1]}
     TIME_NOW=$(date +%s)
     EXEC_TIME=$(( $TIME_NOW - $TIME_START ))
@@ -201,7 +220,7 @@ usage () {
 
 version() {
     log "Displaying version ($PROBE_VERSION)"
-    echo "$0 version $PROBE_VERSION"
+    output "$0 version $PROBE_VERSION"
 }
 
 check_exit_code() {
@@ -210,7 +229,7 @@ check_exit_code() {
 
     if [ $EXCODE -eq "124" ]; then
         log_output "There was a timeout ($TIMEOUT) in dirac's command"
-        EXIT_CODE=$STATE_CRITICAL
+        EXIT_CODE=$STATE_WARNING
     fi
 
     # TODO Check exit code
@@ -231,8 +250,8 @@ check_env() {
 
     if [ -z "$DIRAC" ]; then
         log_output "DIRAC environment not set !"
-        log_output "Please source DIRAC's bashrc !"
-        perf_output $STATE_CRITICAL
+        log_output "Please check probe configuration (DIRAC_PATH ?)"
+        perf_exit $STATE_CRITICAL
     fi
 
     PROXY_INFO=$(check_timeout "dirac-proxy-info -v")
@@ -242,7 +261,7 @@ check_env() {
     if ! [ "$TIME_LEFT" -eq "$TIME_LEFT" ] 2>/dev/null; then
         log_output "Proxy is not valid !"
         log_output "Did you initialise it with 'dirac-proxy-init -g biomed_user' ?"
-        perf_output $STATE_CRITICAL
+        perf_exit $STATE_CRITICAL
     else
         if [ "$TIME_LEFT" -lt "24" ]; then
             log_output "CRITICAL : Proxy is valid for less than a day !!!"
@@ -258,11 +277,17 @@ check_env() {
         fi
     fi
 
-    if [ ! -d $TMP_PATH ]; then
-        log "TMP_PATH Not found !"
-        log "Creating TMP_PATH in $TMP_PATH..."
-        mkdir -p $TMP_PATH
-    fi
+    for DPATH in dirac-jobs dirac-outputs; do
+        if [ ! -d $TMP_PATH/$DPATH ]; then
+            log "$TMP_PATH/$DPATH Not found !"
+            log "Creating in $TMP_PATH/$DPATH..."
+            mkdir -p $TMP_PATH/$DPATH
+        fi
+    done
+
+    JOB_LIST=$TMP_PATH/dirac-jobs
+    JOB_OUT=$TMP_PATH/dirac-outputs
+    JDL=$TMP_PATH/$TXT.jdl
 
     log "Creating JDL at $JDL"
     cat <<EOF > $JDL
@@ -286,7 +311,7 @@ submit_job() {
 delete_job() {
     local ID=$1
     log "Deleting job $ID"
-    sleep 1
+    sleep 2
     check_timeout "dirac-wms-job-delete $ID" >> /dev/null 2>&1
 }
 
@@ -387,6 +412,18 @@ check_status() {
     elif [ "$STATUS" = "Status=Matched;" ]; then
         TMP=$(check_time $ID $FILE 14400)
 
+    elif [ "$STATUS" = "Status=Completed;" ]; then
+        TMP=$(check_time $ID $FILE 14400)
+
+    elif [ "$STATUS" = "Status=Deleted;" ]; then
+        TMP=$(check_time $ID $FILE 14400)
+
+    elif [ "$STATUS" = "Status=Done;" ]; then
+        RCODE=`check_output $ID`
+        delete_job $ID
+        ACTION="Deleting job"
+        TMP="DONOTPARSE"
+
     elif [ "$STATUS" = "Status=Stalled;" ]; then
         TMP=$(check_time $ID $FILE 14400)
         RCODE=$(echo $TMP | awk '{print $1}')
@@ -397,15 +434,6 @@ check_status() {
         fi
         TMP="DONOTPARSE"
 
-    elif [ "$STATUS" = "Status=Completed;" ]; then
-        TMP=$(check_time $ID $FILE 14400)
-
-    elif [ "$STATUS" = "Status=Done;" ]; then
-        RCODE=`check_output $ID`
-        delete_job $ID
-        ACTION="Deleting job"
-        TMP="DONOTPARSE"
-
     elif [ "$STATUS" = "Status=Failed;" ]; then
         delete_job $ID
         RCODE="$STATE_CRITICAL"
@@ -413,7 +441,7 @@ check_status() {
         TMP="DONOTPARSE"
 
     elif [ "$STATUS" = "Status=Killed;" ]; then
-        TMP=$(check_time $ID $FILE 14400)
+        TMP=$(check_time $ID $FILE 3600)
         RCODE=$(echo $TMP | awk '{print $1}')
         ACTION=$(echo $TMP | awk '{print $2}')
         if [ "$RCODE" -gt "0" ]; then
@@ -422,9 +450,6 @@ check_status() {
         fi
         RCODE=$STATE_OK
         TMP="DONOTPARSE"
-
-    elif [ "$STATUS" = "Status=Deleted;" ]; then
-        TMP=$(check_time $ID $FILE 14400)
 
     elif [ "$STATUS" = "" ]; then
         clean_job $ID $FILE
@@ -458,7 +483,6 @@ start_jobs() {
     log_output "JobID to be deleted : $TOBEDELETED"
     delete_job $TOBEDELETED
     perf_compute $EXIT_CODE
-    log_output "----------------------------------------------------"
 }
 
 check_jobs() {
@@ -485,7 +509,6 @@ check_jobs() {
         log_output "No job found to ckeck."
         EXIT_CODE=$STATE_OK
     fi
-    log_output "----------------------------------------------------"
 }
 
 ## Parse arguments                                                           
@@ -505,24 +528,24 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) 
             usage
-            perf_output $STATE_OK
+            perf_exit $STATE_OK
             ;;
         -v|--version)
             version
-            perf_output $STATE_OK
+            perf_exit $STATE_OK
             ;;
         -s|--submit)
             start_jobs
-            perf_output $EXIT_CODE
+            perf_exit $EXIT_CODE
             ;;
         -c|--check) 
             check_jobs
-            perf_output $EXIT_CODE
+            perf_exit $EXIT_CODE
             ;;
         *)
             echo "Incorrect input : $1"
             usage
-            perf_output $STATE_CRITICAL
+            perf_exit $STATE_CRITICAL
             ;;
     esac
 done
