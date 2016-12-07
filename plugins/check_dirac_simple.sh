@@ -33,16 +33,16 @@ DIRAC_PATH=/usr/lib/dirac
 DEBUG=true
 
 # where to put the logs
-LOGFILE=/tmp/dirac_logs
+DEBUGFILE=/tmp/dirac_debug_log
 
 # time allowed for dirac's commands to execute
-TIMEOUT="15s"
+TIMEOUT="5s"
 
 # Job name / comparison sting (no space)
 TXT="FG_Monitoring_Simple_Job"
 
-# temporary path (subdirectories "dirac-jobs" and "dirac-outputs" will be
-# created here).
+# temporary path (subdirs "dirac-jobs", "dirac-outputs" and "dirac-logs" will
+# be created here).
 TMP_PATH=/tmp
 
 # These global vars are not defined for this nagios user/session
@@ -147,7 +147,6 @@ STATUS_ALL=('OK' 'WARNING' 'CRITICAL' 'UNKNOWN' 'DEPENDENT')
 EXIT_CODE=$STATE_OK
 
 # Output computing stuff
-OUTPUT="" 
 NB_JOBS=0
 NB_JOBS_OK=0
 NB_JOBS_WARNING=0
@@ -164,13 +163,12 @@ unset LD_LIBRARY_PATH
 
 log() {
     if $DEBUG; then
-        echo -e "$(date '+%Y-%M-%d %H:%M:%S %Z') $@" >> $LOGFILE
+        echo -e "$(date '+%Y-%M-%d %H:%M:%S %Z') $@" >> $DEBUGFILE
     fi
 }
 
 output() {
-    local TEXT="$1"
-    OUTPUT+="$(date '+%Y-%M-%d %H:%M:%S %Z') $TEXT\n"
+    echo "$(date '+%Y-%M-%d %H:%M:%S %Z') $@" >> $JOB_LOGS/$TIME_START.log
 }
 
 log_output() {
@@ -189,6 +187,11 @@ perf_compute() {
     elif [ "$JOB_STATUS" = "$STATE_CRITICAL" ]; then
         ((NB_JOBS_CRITICAL++))
     fi
+ 
+    if [ "$JOB_STATUS" -gt "$EXIT_CODE" ]; then
+        EXIT_CODE=$JOB_STATUS
+    fi
+
     log "nb_jobs=$NB_JOBS; nb_jobs_ok=$NB_JOBS_OK; nb_jobs_crit=$NB_JOBS_CRITICAL; nb_jobs_warn=$NB_JOBS_WARNING;"
 }
 
@@ -198,7 +201,7 @@ perf_exit() {
     EXEC_TIME=$(( $TIME_NOW - $TIME_START ))
     local OUT_PERF="$STATUS|exec_time=$EXEC_TIME;;;; nb_jobs=$NB_JOBS;;;; nb_jobs_ok=$NB_JOBS_OK;;;; nb_jobs_ko=$NB_JOBS_CRITICAL;;;; nb_jobs_warn=$NB_JOBS_WARNING;;;;"
     echo "$STATUS"
-    echo -e "$OUTPUT"
+    cat $JOB_LOGS/$TIME_START.log
     log "$OUT_PERF"
     echo "$OUT_PERF"
     exit $1
@@ -228,7 +231,7 @@ check_exit_code() {
     log "Exit code is $EXCODE"
 
     if [ $EXCODE -eq "124" ]; then
-        log_output "There was a timeout ($TIMEOUT) in dirac's command"
+        log_output "There was a timeout ($TIMEOUT) in dirac command"
         EXIT_CODE=$STATE_WARNING
     fi
 
@@ -240,6 +243,20 @@ check_timeout() {
     log "Running command : $COMMAND"
     timeout $TIMEOUT $COMMAND
     check_exit_code $?
+}
+
+check_paths() {
+    for DPATH in dirac-jobs dirac-outputs dirac-logs; do
+        if [ ! -d $TMP_PATH/$DPATH ]; then
+            log "$TMP_PATH/$DPATH Not found !"
+            log "Creating in $TMP_PATH/$DPATH..."
+            mkdir -p $TMP_PATH/$DPATH
+        fi
+    done
+
+    JOB_LIST=$TMP_PATH/dirac-jobs
+    JOB_OUT=$TMP_PATH/dirac-outputs
+    JOB_LOGS=$TMP_PATH/dirac-logs
 }
 
 check_env() {
@@ -261,6 +278,7 @@ check_env() {
     if ! [ "$TIME_LEFT" -eq "$TIME_LEFT" ] 2>/dev/null; then
         log_output "Proxy is not valid !"
         log_output "Did you initialise it with 'dirac-proxy-init -g biomed_user' ?"
+        #EXIT_CODE=$STATE_CRITICAL
         perf_exit $STATE_CRITICAL
     else
         if [ "$TIME_LEFT" -lt "24" ]; then
@@ -277,16 +295,6 @@ check_env() {
         fi
     fi
 
-    for DPATH in dirac-jobs dirac-outputs; do
-        if [ ! -d $TMP_PATH/$DPATH ]; then
-            log "$TMP_PATH/$DPATH Not found !"
-            log "Creating in $TMP_PATH/$DPATH..."
-            mkdir -p $TMP_PATH/$DPATH
-        fi
-    done
-
-    JOB_LIST=$TMP_PATH/dirac-jobs
-    JOB_OUT=$TMP_PATH/dirac-outputs
     JDL=$TMP_PATH/$TXT.jdl
 
     log "Creating JDL at $JDL"
@@ -471,6 +479,7 @@ check_status() {
 ## Go for it !
 
 start_jobs() {
+    check_paths
     log_output "------------- New submission starting --------------"
     check_env
     log_output "Submitting some jobs..."
@@ -486,10 +495,11 @@ start_jobs() {
 }
 
 check_jobs() {
+    check_paths
     log_output "--------------- New check starting -----------------"
     check_env
     log_output "Checking jobs from files (if any)..."
-    local FILES=$(find $TMP_PATH -type f)
+    local FILES=$(find $JOB_LIST -type f)
     if [ ${#FILES[@]} -gt 0 ]; then
         for FILE in $FILES; do
             local ID=$(cat $FILE)
@@ -501,9 +511,6 @@ check_jobs() {
             local ACTION=$(echo $TMP | awk '{print $3}')
             perf_compute $RCODE
             log_output "JobID $ID : $STATUS / Action=$ACTION; (${STATUS_ALL[$1]})"
-            if [ "$RCODE" -gt "$EXIT_CODE" ]; then
-                EXIT_CODE=$RCODE
-            fi
         done
     else
         log_output "No job found to ckeck."
