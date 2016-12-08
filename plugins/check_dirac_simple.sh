@@ -36,7 +36,7 @@ DEBUG=true
 DEBUGFILE=/tmp/dirac_debug_log
 
 # time allowed for dirac's commands to execute
-TIMEOUT="5s"
+TIMEOUT="10s"
 
 # Job name / comparison sting (no space)
 TXT="FG_Monitoring_Simple_Job"
@@ -228,6 +228,8 @@ version() {
 
 check_exit_code() {
     local EXCODE=$1
+    local OUT=""
+
     log "Exit code is $EXCODE"
 
     if [ $EXCODE -eq "124" ]; then
@@ -240,7 +242,7 @@ check_exit_code() {
 
 check_timeout() {
     local COMMAND=$1
-    log "Running command : $COMMAND"
+    log_output "Running command : $COMMAND"
     timeout $TIMEOUT $COMMAND
     check_exit_code $?
 }
@@ -268,17 +270,18 @@ check_env() {
     if [ -z "$DIRAC" ]; then
         log_output "DIRAC environment not set !"
         log_output "Please check probe configuration (DIRAC_PATH ?)"
-        perf_exit $STATE_CRITICAL
+        EXIT_CODE=$STATE_CRITICAL
+#        perf_exit $STATE_CRITICAL
     fi
 
     PROXY_INFO=$(check_timeout "dirac-proxy-info -v")
     TIME_LEFT=$(echo "$PROXY_INFO" | awk '/timeleft/ { print $3 }')
     TIME_LEFT=$(echo "$TIME_LEFT" | awk -F ":" '{ print $1 }')
 
+    TIME_LEFT="300"
     if ! [ "$TIME_LEFT" -eq "$TIME_LEFT" ] 2>/dev/null; then
         log_output "Proxy is not valid !"
         log_output "Did you initialise it with 'dirac-proxy-init -g biomed_user' ?"
-        #EXIT_CODE=$STATE_CRITICAL
         perf_exit $STATE_CRITICAL
     else
         if [ "$TIME_LEFT" -lt "24" ]; then
@@ -309,11 +312,18 @@ EOF
 }
 
 submit_job() {
-    local OUT=$TMP_PATH/`date +%s`
+    local OUT=$JOB_LIST/`date +%s`
+    local JOB_ID=""
     log "Submitting job in $OUT"
     check_timeout "dirac-wms-job-submit -f $OUT $JDL" >> /dev/null 2>&1
-    log "JobId submitted is `cat $OUT`"
-    echo `cat $OUT`
+    JOB_ID=$(cat $OUT)
+    if [ "$JOB_ID" -eq "$JOB_ID" ]; then
+        log "JobId submitted is $JOB_ID"
+    else
+        log_output "Cannot submit job !"
+        JOB_ID="NONE"
+    fi
+    echo "$JOB_ID"
 }
 
 delete_job() {
@@ -346,7 +356,7 @@ clean_job() {
     else
         log "Directory $JOB_OUT/$ID not found (so not deleted)..."
     fi
-    #if [ -z ${FILE+x} ] && [ -f $FILE ]; then
+    # TODO if [ -z ${FILE+x} ] && [ -f $FILE ]; then
     if [ -f $FILE ]; then
         log "Removing $FILE : $(rm $FILE)"
     else
@@ -479,19 +489,33 @@ check_status() {
 ## Go for it !
 
 start_jobs() {
+    local JOB_ID=""
     check_paths
     log_output "------------- New submission starting --------------"
     check_env
     log_output "Submitting some jobs..."
     log_output "---"
-    log_output "Normal JobID : $(submit_job)"
-    perf_compute $EXIT_CODE
-    sleep 2
-    local TOBEDELETED=$(submit_job)
-    log_output "---"
-    log_output "JobID to be deleted : $TOBEDELETED"
-    delete_job $TOBEDELETED
-    perf_compute $EXIT_CODE
+
+    JOB_ID=$(submit_job)
+    if [ "$JOB_ID" -eq "$JOB_ID" ] 2>/dev/null; then
+        log_output "Normal JobID : $JOB_ID"
+        perf_compute $EXIT_CODE
+        sleep 2
+    else
+        log_output "CRITICAL : Cannot submit job !"
+        perf_exit $STATE_CRITICAL
+    fi
+
+    JOB_ID=$(submit_job)
+    if [ "$JOB_ID" -eq "$JOB_ID" ] 2>/dev/null; then
+        log_output "---"
+        log_output "JobID to be deleted : $JOB_ID"
+        delete_job $JOB_ID
+        perf_compute $EXIT_CODE
+    else
+        log_output "CRITICAL : Cannot submit job !"
+        perf_exit $STATE_CRITICAL
+    fi
 }
 
 check_jobs() {
