@@ -15,7 +15,10 @@
 # limitations under the License.
 #
 # Description:
-#   Main DIRAC Resource probe.
+#   Main DIRAC probe :
+#       Can submit jobs or check jobs workflow
+#       Management of dirac's command's timeouts
+#       Max script execution time of ~300s (nagios)
 #
 # Changelog:
 # v0.1 2016-12-01 Vincent Gatignol-Jamon <gatignol-jamon@idgrilles.fr>
@@ -23,12 +26,13 @@
 # v0.2 2016-12-07 Vincent Gatignol-Jamon <gatignol-jamon@idgrilles.fr>
 #       Add timeout management of dirac's commands
 #       Workflow review
+# v0.3 2016-12-09 Vincent Gatignol-Jamon <gatignol-jamon@idgrilles.fr>
+#       Better timeout management (dirac + overall script)
 
 ## Please adapt to your local settings
 
 # path to dirac client
-DIRAC_PATH=/opt/dirac
-#DIRAC_PATH=/usr/lib/dirac
+DIRAC_PATH=/usr/lib/dirac
 
 # temporary path (subdirs "dirac-jobs", "dirac-outputs" and "dirac-logs" will
 # be created here).
@@ -55,7 +59,7 @@ export X509_USER_PROXY=/tmp/x509up_u500
 
 ### Do not edit below this line ### 
 
-PROBE_VERSION="0.2"
+PROBE_VERSION="0.3"
 
 ## Workflow
 # ---------
@@ -153,12 +157,10 @@ NB_JOBS_OK=0
 NB_JOBS_WARNING=0
 NB_JOBS_CRITICAL=0
 TIME_START=$(date +%s)
+TXT_START=$(date +%Y%m%d_%H%M%S)
 
 # Get DIRAC environment
 source $DIRAC_PATH/bashrc
-
-# DEBUG...
-#DIRACSCRIPTS=/home/vinc/Documents/monitoring-dirac/plugins/test
 
 # unset LD_LIBRARY_PATH as it cause awk/sed to fail
 unset LD_LIBRARY_PATH
@@ -184,9 +186,8 @@ log() {
     local SEVERITY="$1"
     local TEXT="$2"
 
-    TEXT="$(severity $SEVERITY) $TEXT"
-
     if $DEBUG; then
+        TEXT="$(severity $SEVERITY) $TEXT"
         echo -e "$(date '+%Y-%M-%d %H:%M:%S %Z') $TEXT" >> $DEBUGFILE
     fi
 }
@@ -197,7 +198,7 @@ output() {
 
     TEXT="$(severity $SEVERITY) $TEXT"
 
-    echo "$(date '+%Y-%M-%d %H:%M:%S %Z') $TEXT" >> $JOB_LOGS/$TIME_START.log
+    echo "$(date '+%Y-%M-%d %H:%M:%S %Z') $TEXT" >> $JOB_LOGS/$TXT_START.log
 }
 
 log_output() {
@@ -232,7 +233,7 @@ perf_exit() {
     EXEC_TIME=$(( $TIME_NOW - $TIME_START ))
     local OUT_PERF="$STATUS|exec_time=$EXEC_TIME;;;; nb_jobs=$NB_JOBS;;;; nb_jobs_ok=$NB_JOBS_OK;;;; nb_jobs_ko=$NB_JOBS_CRITICAL;;;; nb_jobs_warn=$NB_JOBS_WARNING;;;;"
     echo "$STATUS"
-    cat $JOB_LOGS/$TIME_START.log
+    cat $JOB_LOGS/$TXT_START.log
     log "I" "$OUT_PERF"
     echo "$OUT_PERF"
     exit $1
@@ -315,15 +316,19 @@ check_env() {
     fi
 
     local TMP="$(check_timeout "$DIRACSCRIPTS/dirac-proxy-info -v")"
-    log "I" "TIMEOUT_INFO : $(echo "$TMP" | awk '/timeout_status/ {print $2}')"
-
+    TIMEOUT_STATUS=$(echo "$TMP" | awk '/timeout_status/ {print $2}')
     TIME_LEFT=$(echo "$TMP" | awk '/timeleft/ { print $3 }')
     TIME_LEFT=$(echo "$TIME_LEFT" | awk -F ":" '{ print $1 }')
 
     if ! [ "$TIME_LEFT" -eq "$TIME_LEFT" ] 2>/dev/null; then
-        log_output "C" "Proxy is not valid !"
-        log_output "C" "Did you initialise it with 'dirac-proxy-init -g biomed_user' ?"
-        perf_exit $STATE_CRITICAL
+        if [ "$TIMEOUT_STATUS" = "timeout" ] && [ -f $X509_USER_PROXY ]; then
+            log_output "W" "Try to use the current proxy ($X509_USER_PROXY)"
+            EXIT_CODE=$STATE_WARNING
+        else
+            log_output "C" "Proxy is not valid !"
+            log_output "C" "Did you initialise it with 'dirac-proxy-init -g biomed_user' ?"
+            perf_exit $STATE_CRITICAL
+        fi
     else
         if [ "$TIME_LEFT" -lt "24" ]; then
             log_output "C" "Proxy is valid for less than a day !!!"
@@ -369,26 +374,28 @@ submit_job() {
 
 delete_job() {
     local ID=$1
-    log "I" "Deleting job $ID"
-    sleep 2
-    check_timeout "$DIRACSCRIPTS/dirac-wms-job-delete $ID" >> /dev/null 2>&1
-}
 
-kill_job() {
-    local ID=$1
-    log "I" "Killing job $ID"
-    check_timeout "$DIRACSCRIPTS/dirac-wms-job-kill $ID" >> /dev/null 2>&1
+    log "I" "Deleting job $ID"
+    local TMP="$(check_timeout "$DIRACSCRIPTS/dirac-wms-job-delete $ID")"
+    local TIMEOUT_STATUS=$(echo "$TMP" | awk '/timeout_status/ {print $2}')
+
+    echo "$TIMEOUT_STATUS"
 }
 
 reschedule_job() {
     local ID=$1
+
     log "I" "Rescheduling job $ID"
-    check_timeout "$DIRACSCRIPTS/dirac-wms-job-reschedule $ID" >> /dev/null 2>&1
+    local TMP="$(check_timeout "$DIRACSCRIPTS/dirac-wms-job-reschedule $ID")"
+    local TIMEOUT_STATUS=$(echo "$TMP" | awk '/timeout_status/ {print $2}')
+
+    echo "$TIMEOUT_STATUS"
 }
 
 clean_job() {
     local ID="$1"
     local FILE="$2"
+
     log "I" "Cleaning job $ID ($FILE)"
 
     if [ -d $JOB_OUT/$ID ]; then
@@ -419,16 +426,24 @@ check_output() {
         ACTION="None"
     elif [ "$(cat $JOB_OUT/$ID/StdOut)" = "$TXT" ]; then
         log_output "I" "Output is good !"
-        RCODE=$STATE_OK
-        delete_job $ID
-        ACTION="Deleting Job"
+        local DTMP=$(delete_job $ID)
+        if [ $DTMP = "ok" ]; then
+            RCODE=$STATE_OK
+            ACTION="Deleting Job"
+        else
+            RCODE=$STATE_WARNING
+            ACTION="None"
+        fi
     else
         log_output "C" "Output is bad.."
         RCODE=$STATE_CRITICAL
-        delete_job $ID
-        ACTION="Deleting Job"
+        local DTMP=$(delete_job $ID)
+        if [ $DTMP = "ok" ]; then
+            ACTION="Deleting Job"
+        else
+            ACTION="None"
+        fi
     fi
-
 
     echo "$RCODE" "$ACTION"
 }
@@ -471,14 +486,12 @@ check_status() {
             ACTION="None"
             STATUS="Status=UnKnown;"
             TMP="DONOTPARSE"
-            log_output "W" "Status=UnKnown; (timeout)"
         else
             log_output "I" "Status=NotFound; (Assuming already deleted)"
         fi
     else
         log_output "I" "$STATUS"
     fi
-
 
     if [ "$STATUS" = "Status=Received;" ]; then
         TMP=$(check_time $ID $FILE 14400)
@@ -509,15 +522,23 @@ check_status() {
         RCODE=$(echo $TMP | awk '{print $1}')
         ACTION=$(echo $TMP | awk '{print $2}')
         if [ "$RCODE" -gt "0" ]; then
-            delete_job $ID
-            ACTION="Deleting job"
+            local DTMP=$(delete_job $ID)
+            if [ $DTMP = "ok" ]; then
+                ACTION="Deleting Job"
+            else
+                ACTION="None"
+            fi
         fi
         TMP="DONOTPARSE"
 
     elif [ "$STATUS" = "Status=Failed;" ]; then
-        delete_job $ID
+        local DTMP=$(delete_job $ID)
+        if [ $DTMP = "ok" ]; then
+            ACTION="Deleting Job"
+        else
+            ACTION="None"
+        fi
         RCODE="$STATE_CRITICAL"
-        ACTION="Deleting job"
         TMP="DONOTPARSE"
 
     elif [ "$STATUS" = "Status=Killed;" ]; then
@@ -525,10 +546,15 @@ check_status() {
         RCODE=$(echo $TMP | awk '{print $1}')
         ACTION=$(echo $TMP | awk '{print $2}')
         if [ "$RCODE" -gt "0" ]; then
-            reschedule_job $ID
-            ACTION="Rescheduling job"
+            local RTMP=$(reschedule_job $ID)
+            if [ $RTMP = "ok" ]; then
+                ACTION="Rescheduling Job"
+                RCODE=$STATE_OK
+            else
+                ACTION="None"
+                RCODE=$STATE_WARNING
+            fi
         fi
-        RCODE=$STATE_OK
         TMP="DONOTPARSE"
 
     elif [ "$STATUS" = "" ] && [ "$TIMEOUT_STATUS" != "timeout" ]; then
@@ -545,7 +571,6 @@ check_status() {
     fi
 
     echo "$RCODE" "$STATUS" "$ACTION"
-    
 }
 
 ## Go for it !
@@ -571,8 +596,14 @@ start_jobs() {
     JOB_ID=$(submit_job)
     if [ "$JOB_ID" -eq "$JOB_ID" ] 2>/dev/null; then
         log_output "I" "JobID to be deleted : $JOB_ID"
-        delete_job $JOB_ID
-        perf_compute $STATE_OK
+        local DTMP=$(delete_job $ID)
+        if [ $DTMP = "ok" ]; then
+            ACTION="Deleting Job"
+            perf_compute $STATE_OK
+        else
+            ACTION="None"
+            perf_compute $STATE_WARNING
+        fi
     else
         perf_compute $STATE_CRITICAL
     fi
@@ -586,15 +617,23 @@ check_jobs() {
     local FILES="$(find $JOB_LIST -type f)"
     if [ "$(echo -ne ${FILES} | wc -m)" -gt "0" ]; then
         for FILE in $FILES; do
+            local TIME_NOW=$(date +%s)
             local ID=$(cat $FILE)
-            log_output "I" "---"
-            log_output "I" "Found JobID $ID from file $FILE"
-            local TMP="$(check_status $ID $FILE)"
-            local RCODE=$(echo $TMP | awk '{print $1}')
-            local STATUS=$(echo $TMP | awk '{print $2}')
-            local ACTION=$(echo $TMP | awk '{print $3}')
-            perf_compute $RCODE
-            log_output "I" "JobID $ID : $STATUS / Action=$ACTION; (${STATUS_ALL[$RCODE]})"
+            if [ "$(( $TIME_NOW - $TIME_START ))" -lt "230" ]; then
+                log_output "I" "---"
+                log_output "I" "Found JobID $ID from file $FILE"
+                local TMP="$(check_status $ID $FILE)"
+                local RCODE=$(echo $TMP | awk '{print $1}')
+                local STATUS=$(echo $TMP | awk '{print $2}')
+                local ACTION=$(echo $TMP | awk '{print $3}')
+                perf_compute $RCODE
+                log_output "I" "JobID $ID : $STATUS / Action=$ACTION; (${STATUS_ALL[$RCODE]})"
+            else
+                log_output "W" "The script was lauched almost 4 minutes ago..."
+                log_output "W" "Skipping job $ID"
+                perf_compute $STATE_WARNING
+                log_output "I" "JobID $ID : NotChecked / Action=Skipping; (WARNING)"
+            fi
         done
     else
         log_output "I" "No job found to ckeck."
@@ -602,7 +641,6 @@ check_jobs() {
 }
 
 ## Parse arguments                                                           
-
 
 # No argument given
 if [ $# -eq 0 ] ; then
