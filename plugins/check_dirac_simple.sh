@@ -596,7 +596,7 @@ start_jobs() {
     JOB_ID=$(submit_job)
     if [ "$JOB_ID" -eq "$JOB_ID" ] 2>/dev/null; then
         log_output "I" "JobID to be deleted : $JOB_ID"
-        local DTMP=$(delete_job $ID)
+        local DTMP=$(delete_job $JOB_ID)
         if [ $DTMP = "ok" ]; then
             ACTION="Deleting Job"
             perf_compute $STATE_OK
