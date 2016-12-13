@@ -34,7 +34,7 @@
 ## Please adapt to your local settings
 
 # path to dirac client
-DIRAC_PATH=/opt/dirac
+DIRAC_PATH=/usr/lib/dirac
 
 # temporary path (subdirs "dirac-jobs", "dirac-outputs" and "dirac-logs" will
 # be created here).
@@ -46,8 +46,11 @@ DEBUG=true
 # where to put the logs
 DEBUGFILE=$TMP_PATH/dirac_debug_log
 
-# time allowed for dirac's commands to execute
-TIMEOUT="20s"
+# time allowed for dirac's commands to execute (seconds)
+TIMEOUT="30"
+
+# Nagios timeout (seconds)
+NAGIOS_TIMEOUT="300"
 
 # Job name / comparison sting (no space)
 TXT="FG_Monitoring_Simple_Job"
@@ -183,32 +186,21 @@ log() {
    local SEVERITY="$1"
    local TEXT="$2"
 
-   if [ "$SEVERITY" = "I" ]; then
-      SEVERITY="INFO"
-   elif [ "$SEVERITY" = "C" ]; then
-      SEVERITY="CRITICAL"
-   elif [ "$SEVERITY" = "W" ]; then
-      SEVERITY="WARNING"
-   elif [ "$SEVERITY" = "D" ]; then
-      SEVERITY="DEBUG"
-   fi
-
    LOG_NOW=$(date '+%Y-%m-%d %H:%M:%S %Z')
 
-   if [ "$SEVERITY" = "DEBUG" ]; then
-      echo -e "$LOG_NOW $SEVERITY $TEXT" >> $DEBUGFILE
+   if [ "$SEVERITY" = "D" ]; then
+      echo -e "$LOG_NOW [$SEVERITY] $TEXT" >> $DEBUGFILE
    else
-      echo "$LOG_NOW $SEVERITY $TEXT" >> $JOB_LOGS/$TXT_START.log
+      echo "$LOG_NOW [$SEVERITY] $TEXT" >> $JOB_LOGS/$TXT_START.log
    fi
 
-   if [ $DEBUG ] && [ "$SEVERITY" != "DEBUG" ]; then
-      echo -e "$LOG_NOW $SEVERITY $TEXT" >> $DEBUGFILE
+   if [ $DEBUG ] && [ "$SEVERITY" != "D" ]; then
+      echo -e "$LOG_NOW [$SEVERITY] $TEXT" >> $DEBUGFILE
    fi
 }
 
 perf_compute() {
    PERF_STATUS=$1
-   log "D" "Before : nb_jobs=$NB_JOBS; nb_jobs_ok=$NB_JOBS_OK; nb_jobs_crit=$NB_JOBS_CRITICAL; nb_jobs_warn=$NB_JOBS_WARNING; nb_cmds=$NB_CMDS; nb_timeouts=$NB_TIMEOUTS"
 
    # Job count
    if [ "$PERF_STATUS" = "$STATE_OK" ]; then
@@ -235,19 +227,19 @@ perf_compute() {
    if [ "$PERF_STATUS" -gt "$EXIT_CODE" ]; then
       EXIT_CODE=$PERF_STATUS
    fi
-
-   log "D" "After : nb_jobs=$NB_JOBS; nb_jobs_ok=$NB_JOBS_OK; nb_jobs_crit=$NB_JOBS_CRITICAL; nb_jobs_warn=$NB_JOBS_WARNING; nb_cmds=$NB_CMDS; nb_timeouts=$NB_TIMEOUTS"
 }
 
 perf_exit() {
    EXIT_STATUS=${STATUS_ALL[$1]}
    PERF_NOW=$(date +%s)
    EXEC_TIME=$(( $PERF_NOW - $TIME_START ))
-   OUT_PERF="$EXIT_STATUS|exec_time=$EXEC_TIME;;;; nb_jobs=$NB_JOBS;;;; nb_jobs_ok=$NB_JOBS_OK;;;; nb_jobs_ko=$NB_JOBS_CRITICAL;;;; nb_jobs_warn=$NB_JOBS_WARNING;;;; nb_cmds=$NB_CMDS;;;; nb_timeouts=$NB_TIMEOUTS;;;;"
-   echo "$EXIT_STATUS"
+   OUT_PERF="exec_time=$EXEC_TIME;;;; nb_jobs=$NB_JOBS;;;; nb_jobs_ok=$NB_JOBS_OK;;;; nb_jobs_ko=$NB_JOBS_CRITICAL;;;; nb_jobs_warn=$NB_JOBS_WARNING;;;; nb_cmds=$NB_CMDS;;;; nb_timeouts=$NB_TIMEOUTS;;;;"
+   OUT_TXT="exec_time=$EXEC_TIME; nb_jobs=$NB_JOBS; nb_jobs_ok=$NB_JOBS_OK; nb_jobs_ko=$NB_JOBS_CRITICAL; nb_jobs_warn=$NB_JOBS_WARNING; nb_cmds=$NB_CMDS; nb_timeouts=$NB_TIMEOUTS;"
+   echo "$EXIT_STATUS / $OUT_TXT"
+   log "I" "$OUT_TXT"
+   log "I" "Global status : $EXIT_STATUS"
    cat $JOB_LOGS/$TXT_START.log
-   log "D" "$OUT_PERF"
-   echo "$OUT_PERF"
+   echo "|$OUT_PERF"
    exit $1
 }
 
@@ -276,8 +268,8 @@ check_exit_code() {
    TIMEOUT_STATUS="false"
 
    if [ "$LAST_EXIT_CODE" -eq "124" ]; then
-      log "W" "There was a timeout ($TIMEOUT) in dirac command"
-      log "W" "Exit code is $LAST_EXIT_CODE : timeout"
+      log "W" "There was a timeout ($TIMEOUT s) in dirac command"
+      log "D" "Exit code is $LAST_EXIT_CODE : timeout"
       perf_compute $STATE_TIMEOUT
       TIMEOUT_STATUS="true"
       if [ "$EXIT_CODE" -lt "$STATE_WARNING" ]; then
@@ -336,7 +328,7 @@ check_env() {
          log "W" "Try to use the current proxy ($X509_USER_PROXY)"
          EXIT_CODE=$STATE_WARNING
       else
-         log "C" "Proxy is not valid !"
+         log "C" "Proxy not found !"
          log "C" "Did you initialise it with 'dirac-proxy-init -g biomed_user' ?"
          perf_exit $STATE_CRITICAL
       fi
@@ -377,7 +369,6 @@ submit_job() {
    check_timeout "$DIRACSCRIPTS/dirac-wms-job-submit -f $OUT $JDL"
 
    JOB_ID=$(cat $OUT)
-   log "D" "JobSubmitted $JOB_ID / TO $TIMEOUT_STATUS / $([ "$JOB_ID" -ne "$JOB_ID" ])"
    if [ "$TIMEOUT_STATUS" = "true" ] || [ "$JOB_ID" -ne "$JOB_ID" ] 2>/dev/null; then
       log "C" "Cannot submit job !"
       JOB_ID="None"
@@ -394,6 +385,11 @@ submit_job() {
 delete_job() {
    log "I" "Deleting job $1"
    check_timeout "$DIRACSCRIPTS/dirac-wms-job-delete $1"
+}
+
+kill_job() {
+   log "I" "Killing job $1"
+   check_timeout "$DIRACSCRIPTS/dirac-wms-job-kill $1"
 }
 
 reschedule_job() {
@@ -419,25 +415,6 @@ clean_job() {
       log "I" "Removing $FILE $(rm $FILE)"
    else
       log "I" "File $FILE Not found (so not removed)..."
-   fi
-}
-
-check_output() {
-   ID=$1
-
-   log "I" "Checking output of job $ID"
-
-   check_timeout "$DIRACSCRIPTS/dirac-wms-job-get-output -D $JOB_OUT $ID"
-
-   if [ -f $JOB_OUT/$ID/StdOut ] && [ "$(cat $JOB_OUT/$ID/StdOut)" = "$TXT" ]; then
-      log "I" "Output is good !"
-      RCODE=$STATE_OK
-   elif [ "$TIMEOUT_STATUS" = "true" ]; then
-      log "W" "Cannot stat Output (timeout)"
-      RCODE=$STATE_WARNING
-   else
-      log "C" "Output is bad.."
-      RCODE=$STATE_CRITICAL
    fi
 }
 
@@ -467,29 +444,32 @@ check_status() {
    ID=$1
    FILE=$2
 
-   #RCODE=$STATE_UNKNOWN
-   #ACTION="Not_defined_yet"
-   #TMP="$RCODE $ACTION"
+   RCODE=$STATE_UNKNOWN
+   ACTION="Not_defined_yet"
 
    log "I" "Checking status of job $ID"
    check_timeout "$DIRACSCRIPTS/dirac-wms-job-status $ID"
 
    STATUS=$(echo "$OUTPUT" | awk '/Status=/ {print $2}')
 
-   # Display job status
    if [ "$STATUS" = "" ]; then
       if [ "$TIMEOUT_STATUS" = "true" ]; then
          RCODE=$STATE_WARNING
          ACTION="None/Timeout"
          STATUS="Status=UnKnown;"
+         log "I" "$STATUS"
       else
          RCODE=$STATE_OK
          ACTION="Cleaning"
          STATUS="Status=NotFound;"
+         log "I" "$STATUS"
          clean_job "$ID" "$FILE"
       fi
+   else
+      log "I" "$STATUS"
+   fi
 
-   elif [ "$STATUS" = "Status=Received;" ]; then
+   if [ "$STATUS" = "Status=Received;" ]; then
       check_time $ID $FILE 14400
 
    elif [ "$STATUS" = "Status=Checking;" ]; then
@@ -511,7 +491,30 @@ check_status() {
       check_time $ID $FILE 14400
 
    elif [ "$STATUS" = "Status=Done;" ]; then
-      check_output $ID
+      log "I" "Checking output of job $ID"
+      check_timeout "$DIRACSCRIPTS/dirac-wms-job-get-output -D $JOB_OUT $ID"
+      if [ -f $JOB_OUT/$ID/StdOut ] && [ "$(cat $JOB_OUT/$ID/StdOut)" = "$TXT" ]; then
+         log "I" "Output is good !"
+         delete_job $ID
+         if [ "$TIMEOUT_STATUS" = "true" ]; then
+            ACTION="None/Timeout"
+            RCODE=$STATE_WARNING
+         elif [ "$LAST_EXIT_CODE" -ne "$STATE_OK" ]; then
+            ACTION="None/Error"
+            RCODE=$STATE_WARNING
+         else
+            ACTION="Deleting"
+            RCODE=$STATE_OK
+         fi
+      elif [ "$TIMEOUT_STATUS" = "true" ]; then
+         log "W" "Cannot stat Output (timeout)"
+         RCODE=$STATE_WARNING
+         ACTION="None/Timeout"
+      else
+         log "C" "Output is bad.."
+         RCODE=$STATE_CRITICAL
+         ACTION="None/Error"
+      fi
 
    elif [ "$STATUS" = "Status=Stalled;" ]; then
       check_time $ID $FILE 14400
@@ -522,7 +525,7 @@ check_status() {
          elif [ "$LAST_EXIT_CODE" -ne "$STATE_OK" ]; then
             ACTION="None/Error"
          else
-            ACTION="Deleting Job"
+            ACTION="Deleting"
          fi
       fi
 
@@ -533,7 +536,7 @@ check_status() {
       elif [ "$LAST_EXIT_CODE" -ne "$STATE_OK" ]; then
          ACTION="None/Error"
       else
-         ACTION="Deleting Job"
+         ACTION="Deleting"
       fi
       RCODE="$STATE_CRITICAL"
 
@@ -546,12 +549,13 @@ check_status() {
          elif [ "$LAST_EXIT_CODE" -ne "$STATE_OK" ]; then
             ACTION="None/Error"
          else
-            ACTION="Rescheduling Job"
+            ACTION="Rescheduling"
+            RCODE=$STATE_OK
          fi
       fi
    fi
 
-   log "I" "JobID $ID : $STATUS / Action=$ACTION; (${STATUS_ALL[$RCODE]})"
+   log "I" "JobID $ID : $STATUS Action=$ACTION; (${STATUS_ALL[$RCODE]})"
 }
 
 ## Go for it !
@@ -564,16 +568,14 @@ start_jobs() {
    log "I" "---"
    submit_job
 
-   sleep 1
-
    log "I" "---"
    submit_job
 
    if [ "$TIMEOUT_STATUS" = "true" ] || [ "$JOB_ID" -ne "$JOB_ID" ] 2>/dev/null; then
-      log "W" "Last Submission failed, cannot delete nonexistent job"
+      log "W" "Last Submission failed, cannot kill nonexistent job"
    else
-      log "I" "JobID to be deleted : $JOB_ID"
-      delete_job $JOB_ID
+      log "I" "JobID to be killed : $JOB_ID"
+      kill_job $JOB_ID
 
       if [ "$TIMEOUT_STATUS" = "true" ]; then
          ACTION="None/Timeout"
@@ -582,7 +584,7 @@ start_jobs() {
          ACTION="None/Error"
          perf_compute $STATE_WARNING
       else
-         ACTION="Deleting Job"
+         ACTION="Killing"
          perf_compute $STATE_OK
       fi
    fi
@@ -593,28 +595,31 @@ check_jobs() {
    check_env
    log "I" "Checking jobs from files (if any)..."
 
-   local FILES="$(find $JOB_LIST -type f)"
+   local FILES="$(find $JOB_LIST -type f | sort)"
    if [ "$(echo -ne ${FILES} | wc -m)" -gt "0" ]; then
+
+      ALLOWED_TIME=$(date +%-Mm%-Ss --date=@$((NAGIOS_TIMEOUT - (TIMEOUT * 3) - 2 )))
+      T_START=$(date +%-H:%-M:%-S --date=@$TIME_START)
+      log "I" "Total allowed running time before skipping jobs : $ALLOWED_TIME (from $T_START)"
 
       for FILE in $FILES; do
          JOB_ID=$(cat $FILE)
          log "I" "---"
          if [ "$JOB_ID" -eq "$JOB_ID" ] 2>/dev/null; then
             TIME_NOW=$(date +%s)
-            log "I" "We have an integer, assuming this is a Job_ID"
-            log "D" "NOW: $TIME_NOW / START: $TIME_START / NOTO: $NOTIMEOUT"
+            log "I" "We have an integer, assuming this is a JobID"
             if [ "$(( $TIME_NOW - $TIME_START ))" -lt "230" ] || [ "$NOTIMEOUT" = "true" ] ; then
                log "I" "Found JobID $JOB_ID from file $FILE"
                check_status $JOB_ID $FILE
                perf_compute $RCODE
             else
-               log "W" "The script was lauched almost 4 minutes ago..."
-               log "W" "Skipping job $ID"
+               log "W" "The script was lauched almost $ALLOWED_TIME ago..."
+               log "W" "Skipping job $JOB_ID"
                perf_compute $STATE_WARNING
-               log "W" "JobID $ID : NotChecked / Action=Skipping; (WARNING)"
+               log "W" "JobID $JOB_ID : NotChecked / Action=Skipping; (WARNING)"
             fi
          else
-            log "W" "What is this ? ($ID from $FILE) Is not a JobID !"
+            log "W" "What is this ? ($JOB_ID from $FILE) Is not a JobID !"
          fi
       done
    else
